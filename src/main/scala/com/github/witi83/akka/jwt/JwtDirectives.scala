@@ -1,9 +1,12 @@
 package com.github.witi83.akka.jwt
 
+import java.text.ParseException
 import java.time.Instant
 import java.util.Date
 
 import akka.http.scaladsl.server.{AuthorizationFailedRejection, Directive1}
+import akka.http.scaladsl.server.Directives._
+
 import com.nimbusds.jose.crypto.{MACSigner, MACVerifier}
 import com.nimbusds.jose.{JWSAlgorithm, JWSHeader, JWSObject, Payload}
 import com.nimbusds.jwt.JWTClaimsSet
@@ -18,8 +21,6 @@ import scala.util.Try
  * Provides utilities for signing and verification by the JSON Web Token (JWT).
  */
 trait JwtDirectives {
-
-  import akka.http.scaladsl.server.Directives._
 
   /**
    * An `AsyncAuthenticator` which returns a JWS object.
@@ -39,9 +40,9 @@ trait JwtDirectives {
    * The execution context to run a `Future` returned from `authenticator`.
    */
   def jwtAuthenticator[T](authenticator: AsyncAuthenticator[T])
-                         (implicit claimBuilder: JwtClaimBuilder.SubjectExtrator[T],
-                          signer: JWTClaimsSet => Option[JWSObject],
-                          executionContext: ExecutionContext): AsyncAuthenticator[JWSObject] =
+    (implicit claimBuilder: JwtClaimBuilder.SubjectExtrator[T],
+              signer: JWTClaimsSet => Option[JWSObject],
+              executionContext: ExecutionContext): AsyncAuthenticator[JWSObject] =
     authenticator(_) map {
       case Some(t) => claimBuilder(t) flatMap signer
       case None => None
@@ -50,95 +51,121 @@ trait JwtDirectives {
   /**
    * Verifies a token sent with an HTTP request.
    *
-   * A token should be sent through the `Authorization` header like,
+   * Thanks to [[JwtAuthorizationMagnet]], this directive works like the
+   * following functions,
    * {{{
-   * Authorization: Bearer JWT
+   * authorizeToken[T](verifier: JWTClaimsSet => Option[T])
+   *   (implicit confirmer: JWSObject => Option[JWTClaimsSet]): Directive1[T]
+   *
+   * authorizeToken[T](extractor: Directive1[Option[JWSObject]],
+   *                   verifier: JWTClaimsSet => Option[T])
+   *   (implicit confirmer: JWSObject => Option[JWTClaimsSet]): Directive1[T]
    * }}}
    *
-   * Thanks to [[JwtAuthorizationMagnet]], this directive will end up
-   * the following form,
-   * {{{
-   * authorizeToken[T](privilege: JWTClaimsSet => Option[T])
-   *   (implicit verifier: JWSObject => Option[JWTClaimsSet]): Directive1[T]
-   * }}}
+   * This directive
+   *  1. Extracts a JWS from the request through `extractor`.
+   *  1. Confirms the signature of the JWS and extracts the claims set by `confirmer`.
+   *  1. Verifies the claims set by `verifier`.
+   *  1. Supplies the result from `verifier` to the inner route.
    *
-   * And will
-   * 1. Obtain the value associated with "Authorization" header.
-   * 1. Extract a JWT from the "Authorization" header value.
-   * 1. Verify the JWT with `verifier` and extract a claim set.
-   * 1. Apply `privilege` to the claim set.
-   * 1. Supply the result from `privilege` to the inner route.
-   *
-   * Will reject,
-   * - if no "Authorization" header is specified,
-   * - or if the "Authorization" header does not specify a JWT,
-   * - or if `verifier` cannot verify the JWT,
-   * - or if `privilege` rejects the claims set.
+   * Rejects
+   *  - if `extractor` cannot extract a JWS from the request,
+   *  - or if `confirmer` cannot confirm the signature of a JWS,
+   *  - or if `confirmer` cannot extract the claims set from a JWS,
+   *  - or if `verifier` rejects the claims set.
    *
    */
-  def authorizeToken[T](magnet: JwtAuthorizationMagnet[T]): Directive1[T] = {
-    val prefix = "Bearer "
-
-    val extractJwt = (value: String) => if (value.startsWith(prefix)) {
-      Try(Some(JWSObject.parse(value.substring(prefix.length)))) getOrElse None
-    } else {
-      None
+  def authorizeToken[T](magnet: JwtAuthorizationMagnet[T]): Directive1[T] =
+    magnet.extractor flatMap { jwsOpt =>
+      jwsOpt flatMap { jws =>
+        magnet.confirmer(jws) flatMap { token =>
+          magnet.verifier(token)
+        }
+      } match {
+        case Some(result) => provide(result)
+        case _ => reject(AuthorizationFailedRejection)
+      }
     }
-
-    optionalHeaderValueByName("Authorization") flatMap { optionalHeader =>
-      (for {
-        header <- optionalHeader
-        jws <- extractJwt(header)
-        claimsSet <- magnet.verifier(jws)
-        privileged <- magnet.privilege(claimsSet)
-      } yield provide(privileged)) getOrElse reject(AuthorizationFailedRejection)
-    }
-  }
 }
 
+/** Companion object of [[JwtDirectives]]. */
 object JwtDirectives extends JwtDirectives
 
 /**
- * Magnet which attracts parameters necessary for the `authorizeToken`
+ * Magnet that attracts parameters necessary for the `authorizeToken`
  * directive.
+ *
+ * @constructor
+ * @tparam T
+ *     Outcome type of `verifier`.
+ * @param extractor
+ *     Extracts a JSON Web Signature (JWS) from an HTTP request.
+ * @param confirmer
+ *     Confirms the signature of the JWS and extracts the claims set.
+ * @param verifier
+ *     Verifiers the claims set and converts it to an application-specific
+ *     object.
  */
-case class JwtAuthorizationMagnet[T](privilege: JWTClaimsSet => Option[T])(implicit val verifier: JWSObject => Option[JWTClaimsSet])
+case class JwtAuthorizationMagnet[T](
+  extractor: Directive1[Option[JWSObject]],
+  confirmer: JWSObject => Option[JWTClaimsSet],
+  verifier: JWTClaimsSet => Option[T])
 
+/** Companion object of [[JwtAuthorizationMagnet]]. */
 object JwtAuthorizationMagnet {
   /**
-   * Implicitly converts a given privilege function into
+   * Implicitly converts a given verifier function into
    * a [[JwtAuthorizationMagnet]].
    *
-   * @param privilege
-   * Returns a context dependent object if a given claim set has
-   * a privilege otherwise `None`.
+   * @param verifier
+   *     Returns an application-specific object if a given claims set is
+   *     verified, otherwise `None`.
    */
-  implicit def fromPrivilege[T](privilege: JWTClaimsSet => Option[T])(implicit verifier: JWSObject => Option[JWTClaimsSet]): JwtAuthorizationMagnet[T] =
-    JwtAuthorizationMagnet(privilege)
+  implicit def fromVerifier[T](verifier: JWTClaimsSet => Option[T])
+    (implicit confirmer: JWSObject => Option[JWTClaimsSet]):
+      JwtAuthorizationMagnet[T] = JwtAuthorizationMagnet(
+        JwsExtractor.extractJwsFromAuthorizationHeader,
+        confirmer,
+        verifier)
+
+  /**
+    * Implicitly converts a given pair of an extractor directive and a verifier
+    * function into a [[JwtAuthorizationMagnet]].
+    *
+    * @param ev
+    *     `ev._1` extracts a JWS from an HTTP request.
+    *     `ev._2` verifies a given claims set and returns an application-specific
+    *     object.
+    */
+  implicit def fromExtractor[T](ev: (Directive1[Option[JWSObject]],
+                                    JWTClaimsSet => Option[T]))
+    (implicit confirmer: JWSObject => Option[JWTClaimsSet]):
+      JwtAuthorizationMagnet[T] =
+        JwtAuthorizationMagnet(ev._1, confirmer, ev._2)
 }
 
 /**
  * Provides signature signer and verifier for JWS.
  *
  * @param algorithm
- * The name of the signature algorithm.
+ * Name of the signature algorithm.
  * @param secret
- * The secret key for signature.
+ * Secret key for the signature algorithm.
  */
 case class JwtSignature(algorithm: JWSAlgorithm, secret: String) {
-  /** The common header of JWS objects. */
+  /** Common header of JWS objects. */
   private[this] val header = new JWSHeader(algorithm)
 
-  /** The common signer for JWS objects. */
+  /** Common signer for JWS objects. */
   private[this] val signer = new MACSigner(secret.getBytes)
 
-  /** The common verifier for JWS objects. */
+  /** Common verifier for JWS objects. */
   private[this] val verifier = new MACVerifier(secret.getBytes)
 
   /**
-   * The implicit signer for JWS objects.
+   * Implicit signer for JWS objects.
    *
-   * Signs a given claim set and returns a signed JWS object.
+   * Signs a given claims set and returns a signed JWS object.
    */
   implicit def jwtSigner(claim: JWTClaimsSet): JWSObject = {
     val jwsObject = new JWSObject(header, new Payload(claim.toJSONObject))
@@ -151,7 +178,7 @@ case class JwtSignature(algorithm: JWSAlgorithm, secret: String) {
   /**
    * The implicit verifier for JWS objects.
    *
-   * Verifies a given JWS object and returns a contained claim set.
+   * Confirms the signature of a given JWS object and returns its claims set.
    */
   implicit def jwtVerifier(token: JWSObject): Option[JWTClaimsSet] = if (token.verify(verifier)) {
     Try(Some(JWTClaimsSet.parse(token.getPayload.toJSONObject))) getOrElse None
@@ -159,7 +186,7 @@ case class JwtSignature(algorithm: JWSAlgorithm, secret: String) {
 }
 
 /**
- * A claim builder.
+ * Claim builder.
  *
  * You can chain multiple claim builders by `&&` operator.
  */
@@ -172,10 +199,10 @@ trait JwtClaimBuilder[T] extends JwtClaimBuilder.SubjectExtrator[T] {
    * Builds a claim.
    *
    * @param input
-   * The input for the claim builder.
+   * Input for the claim builder.
    * Usually an output from an authenticator.
    * @return
-   * The claim build from `input`.
+   * Claims set build from `input`.
    */
   def apply(input: T): Option[JWTClaimsSet]
 
@@ -186,9 +213,9 @@ trait JwtClaimBuilder[T] extends JwtClaimBuilder.SubjectExtrator[T] {
    * claim builder.
    *
    * @param after
-   * The claim builder which appends claims after this claim builder.
+   * Claim builder that appends claims after this claim builder.
    * @return
-   * A new claim builder which builds a claim set by this claim builder and
+   * New claim builder which builds a claims set by this claim builder and
    * `after`.
    */
   def &&(after: SubjectExtrator[T]): SubjectExtrator[T] = input => mergeClaims(self(input), after(input))
@@ -199,14 +226,15 @@ trait JwtClaimBuilder[T] extends JwtClaimBuilder.SubjectExtrator[T] {
    * Claims in `second` have precedence over claims in `first`.
    *
    * @param first
-   * The first claim set.
+   * First claims set.
    * @param second
-   * The second claim set.
+   * Second claims set.
    * @return
-   * A new claim set which has claims in both `first` and `second`.
+   * New claims set that has claims in both `first` and `second`.
    * `None` if `first` or `second` is `None`.
    */
-  private def mergeClaims(first: Option[JWTClaimsSet], second: Option[JWTClaimsSet]) =
+  private def mergeClaims(first: Option[JWTClaimsSet],
+                          second: Option[JWTClaimsSet]): Option[JWTClaimsSet] =
     for {
       claims1 <- first
       claims2 <- second
@@ -227,8 +255,8 @@ object JwtClaimBuilder {
    * Returns a claim builder which sets the "exp" field to an expiration time.
    *
    * @param duration
-   * The valid duration of a JWT.
-   * The minimum resolution is one minute.
+   * Valid duration of a JWT.
+   * Minimum resolution is one minute.
    */
   def claimExpiration[T](duration: Duration): SubjectExtrator[T] = input => {
     val validUntil = new Date(Instant.now().plusSeconds(duration.toSeconds).toEpochMilli)
@@ -239,7 +267,7 @@ object JwtClaimBuilder {
    * Returns a claim builder which sets the "iss" field to a specified string.
    *
    * @param issuer
-   * The issuer of a JWT.
+   * Issuer of a JWT.
    */
   def claimIssuer[T](issuer: String): SubjectExtrator[T] = input => Some(new Builder().issuer(issuer).build())
 
@@ -247,7 +275,7 @@ object JwtClaimBuilder {
    * Returns a claim builder which sets the "sub" field.
    *
    * @param subject
-   * A function which extracts the subject from an input.
+   * Extracts the subject from an input.
    */
   def claimSubject[T](subject: T => String): SubjectExtrator[T] = input => Some(new Builder().subject(subject(input)).build())
 
@@ -260,38 +288,94 @@ object JwtClaimBuilder {
     }
 }
 
+/** Provides common JWS extractors. */
+object JwsExtractor {
+  /**
+    * Extracts a JWS from "Authorization" header of an HTTP request.
+    *
+    * A JWS should be sent through "Authorization" header like,
+    * {{{
+    * Authorization: Bearer JWS
+    * }}}
+    *
+    * @return
+    *     Directive that extracts a JWS from "Authorization" header of an HTTP
+    *     request.
+    *     This directive provides `None` if an HTTP request does not have
+    *     "Authorization" header, or if the value of "Authorization" header is
+    *     invalid.
+    */
+  val extractJwsFromAuthorizationHeader: Directive1[Option[JWSObject]] =
+    optionalHeaderValueByName("Authorization") flatMap { tokenOpt =>
+      provide {
+        tokenOpt flatMap { token =>
+          val prefix = "Bearer "
+          if (token.startsWith(prefix))
+            try
+              Some(JWSObject.parse(token.substring(prefix.length)))
+            catch {
+              case _: ParseException => None
+            }
+          else
+            None
+        }
+      }
+    }
+
+  /**
+    * Extracts a JWS from a cookie that has a given name.
+    *
+    * @param name
+    *     Name of a cookie from which a JWS is to be extracted.
+    * @return
+    *     Directive that extracts a JWS from a cookie given by `name`.
+    *     This directive provides `None` if no cookie corresponding to `name`
+    *     exists, or if the value of the cookie is invalid.
+    */
+  def extractJwsFromCookie(name: String): Directive1[Option[JWSObject]] =
+    optionalCookie(name) flatMap { ckOpt =>
+      provide {
+        ckOpt flatMap { ck =>
+          try
+            Some(JWSObject.parse(ck.value))
+          catch {
+            case _: ParseException => None
+          }
+        }
+      }
+    }
+}
+
 /**
- * A privilege which verifies a claim set.
+ * Verifies a claims set.
  *
- * Instance of this trait can be passed as a `privilege` argument of the
+ * Instance of this trait can be passed as a `verifier` argument of the
  * `authorizeToken` directive.
  */
 trait JwtClaimVerifier extends JwtClaimVerifier.PrivilegeFunction {
   self =>
 
-  import JwtClaimVerifier.PrivilegeFunction
-
   /**
-   * Verifies a specified claim set.
+   * Verifies a given claims set.
    *
    * @param claims
-   * The claim set to be verified.
+   * Claims set to be verified.
    * @return
-   * The verified claim set. `None` if `claim` is not verified.
+   * Verified claims set. `None` if `claims` is not verified.
    */
   def apply(claims: JWTClaimsSet): Option[JWTClaimsSet]
 
   /**
-   * Chains a specified privilege function after this claim verifier.
+   * Chains a given claim verifier after this claim verifier.
    *
    * `after` will not be applied if this claim verifier fails.
    *
    * @param after
-   * The privilege function to be applied after this claim verifier.
+   *  Claim verifier to be applied after this claim verifier.
    * @return
-   * A new privilege which applies this claim verifier and then `after`.
+   *  New claim verifier that applies this claim verifier and then `after`.
    */
-  def &&[T](after: PrivilegeFunction): PrivilegeFunction = claims =>
+  def &&[T](after: JWTClaimsSet => Option[T]): JWTClaimsSet => Option[T] = claims =>
     for {
       first <- self(claims)
       second <- after(first)
@@ -305,7 +389,7 @@ object JwtClaimVerifier {
   /**
    * Returns a privileging function which verifies the expiration time.
    *
-   * If a specified claim set does not have "exp" field, verification of it
+   * If a specified claims set does not have "exp" field, verification of it
    * fails; i.e., returns `None`.
    */
   def verifyNotExpired: PrivilegeFunction = claims => {
@@ -314,7 +398,9 @@ object JwtClaimVerifier {
     Option(claims.getExpirationTime) filter isValid map (_ => claims) orElse None
   }
 
-  /** Implicitly converts a claim verifier into a [[JwtClaimVerifier]]. */
+  /**
+    * Implicitly converts a claim verifier function into a [[JwtClaimVerifier]].
+    */
   implicit def toJwtClaimVerifier(f: PrivilegeFunction): JwtClaimVerifier =
     new JwtClaimVerifier {
       override def apply(claims: JWTClaimsSet): Option[JWTClaimsSet] = f(claims)
