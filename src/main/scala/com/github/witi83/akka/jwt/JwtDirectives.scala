@@ -2,7 +2,7 @@ package com.github.witi83.akka.jwt
 
 import java.text.ParseException
 import java.time.Instant
-import java.util.Date
+import java.util.{Date, Calendar}
 
 import akka.http.scaladsl.server.{AuthorizationFailedRejection, Directive1}
 import akka.http.scaladsl.server.Directives._
@@ -254,13 +254,16 @@ object JwtClaimBuilder {
   /**
    * Returns a claim builder which sets the "exp" field to an expiration time.
    *
+   * If `duration` is less than one second, it will be treated as 0.
+   *
    * @param duration
    * Valid duration of a JWT.
-   * Minimum resolution is one minute.
+   * Minimum resolution is one second.
    */
   def claimExpiration[T](duration: Duration): SubjectExtrator[T] = input => {
-    val validUntil = new Date(Instant.now().plusSeconds(duration.toSeconds).toEpochMilli)
-    Some(new Builder().expirationTime(validUntil).build())
+    val validUntil = Calendar.getInstance()
+    validUntil.add(Calendar.SECOND, duration.toSeconds.toInt)
+    Some(new Builder().expirationTime(validUntil.getTime).build())
   }
 
   /**
