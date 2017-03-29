@@ -17,9 +17,13 @@ scalacOptions := Seq("-deprecation",
                      "-Xfuture")
 
 libraryDependencies ++= {
+  val akkaHttpVersion = "10.0.1"
   Seq(
-    "com.typesafe.akka" %% "akka-http" % "10.0.1",
-    "com.nimbusds" % "nimbus-jose-jwt" % "4.33"
+    "com.typesafe.akka" %% "akka-http"          % akkaHttpVersion,
+    "com.nimbusds"      %  "nimbus-jose-jwt"    % "4.33",
+
+    "org.scalatest"     %% "scalatest"          % "3.0.1" % "test",
+    "com.typesafe.akka" %% "akka-http-testkit"  % akkaHttpVersion % "test"
   )
 }
 
